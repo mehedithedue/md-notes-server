@@ -12,7 +12,8 @@ time and writes the result into ./_site:
     _site/assets/...       fonts, mermaid and highlight.js, served from the bucket
 
     python3 build_site.py                            # build into ./_site
-    python3 build_site.py --sort created             # order by creation date
+    python3 build_site.py --sort updated             # last content change first
+    python3 build_site.py --fresh-days 14            # badge anything changed in 2 weeks
     python3 build_site.py --deploy s3://my-bucket    # build, then upload
     python3 build_site.py --deploy s3://my-bucket --prune   # also delete removed docs
 
@@ -23,12 +24,21 @@ an index document for "/". Open the site at .../index.html.
 Compared to serve.py the only thing missing is live reload: there is no
 server left to watch the files. Rebuild and redeploy instead.
 
+Every build records a content hash of each source in ./.build_history.json
+(next to this script, outside _site). The next build compares against it, so
+a card can say "new" (first seen recently) or "updated" (text changed
+recently) and `--sort updated` can float changed documents to the top. File
+timestamps alone cannot do this: regenerating a page or checking out a branch
+touches mtime without changing a word. On the very first build, with no
+history yet, the file system dates seed the history instead.
+
 The bucket needs a public-read bucket policy (or CloudFront in front of it)
 and the AWS CLI must be installed and signed in (`brew install awscli`,
 then `aws configure`).
 """
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -48,7 +58,9 @@ import serve  # noqa: E402
 ROOT = serve.ROOT
 OUT = os.path.join(ROOT, "_site")
 MARKER = os.path.join(OUT, ".build_site")   # proves _site is ours before it is wiped
+HISTORY = os.path.join(ROOT, ".build_history.json")   # content hashes from earlier builds
 TITLE = "Docs Library"
+FRESH_DAYS = 7          # how recent "new" / "updated" has to be to earn a badge
 
 
 # --------------------------------------------------------------------------
@@ -126,6 +138,8 @@ $boot
 <style>
 $theme
 $css
+.badge.new { background: rgba(88,166,255,.16); color: var(--accent); }
+.badge.updated { background: rgba(63,185,80,.16); color: #3fb950; }
 </style>
 </head>
 <body>
@@ -293,8 +307,14 @@ def render_index(docs, sort):
     cards = []
     for d in docs:
         badge = '<span class="badge live">from md</span>' if d["live"] else ""
+        if d["fresh"]:
+            badge = '<span class="badge %s">%s</span>' % (d["fresh"], d["fresh"]) + badge
         if d["folder"]:
             badge = '<span class="badge folder">%s</span>' % html.escape(d["folder"]) + badge
+        if d["changed"] > d["first_seen"]:
+            date = "updated " + d["changed"].strftime("%b %d, %Y")
+        else:
+            date = d["first_seen"].strftime("%b %d, %Y")
         cards.append(
             '<a class="card" href="{href}" data-href="{href}" data-file="{file}" data-title="{search}">'
             '<div class="card-top"><span class="card-title">{title}</span>{badge}</div>'
@@ -309,7 +329,7 @@ def render_index(docs, sort):
                 badge=badge,
                 minutes=d["minutes"],
                 words=d["words"],
-                date=d["when"].strftime("%b %d, %Y"),
+                date=date,
             )
         )
 
@@ -334,23 +354,85 @@ def render_index(docs, sort):
 # Build
 # --------------------------------------------------------------------------
 
-def doc_when(path, sort):
-    st = os.stat(path)
-    # st_birthtime is the real creation time on macOS; elsewhere fall back to mtime.
-    ts = getattr(st, "st_birthtime", st.st_mtime) if sort == "created" else st.st_mtime
-    return datetime.fromtimestamp(ts)
+def load_history():
+    """{out_path: {"hash", "first_seen", "changed"}} from the previous build, or {}."""
+    try:
+        with open(HISTORY, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
-def collect_docs(sort):
+def save_history(docs):
+    """Only documents that still exist are kept, so removed files drop out."""
+    data = {
+        d["out"]: {
+            "hash": d["hash"],
+            "first_seen": d["first_seen"].isoformat(timespec="seconds"),
+            "changed": d["changed"].isoformat(timespec="seconds"),
+        }
+        for d in docs
+    }
+    with open(HISTORY, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+        f.write("\n")
+
+
+def content_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def collect_docs(sort, fresh_days):
+    """Every document with its dates. "first_seen" and "changed" come from the
+    build history when there is one, so they track real content changes rather
+    than file timestamps. Without history they are seeded from the file system."""
+    history = load_history()
+    now = datetime.now()
+    fresh_after = now.timestamp() - fresh_days * 86400
+
     docs = []
     for d in serve.list_docs():
         src = os.path.join(ROOT, d["file"])
         d = dict(d)
         d["src"] = src
         d["out"] = os.path.splitext(d["file"])[0] + ".html"   # a .md becomes .html
-        d["when"] = doc_when(src, sort)
+        d["hash"] = content_hash(src)
+        d["modified"] = datetime.fromtimestamp(d["mtime"])
+
+        prev = history.get(d["out"])
+        if prev:
+            d["first_seen"] = datetime.fromisoformat(prev["first_seen"])
+            if prev["hash"] == d["hash"]:
+                d["changed"] = datetime.fromisoformat(prev["changed"])
+            else:
+                d["changed"] = now
+        else:
+            # No history for this file. With a history file present that means it
+            # is genuinely new; on the very first build, trust the file system.
+            d["first_seen"] = datetime.fromtimestamp(d["created"])
+            if history:
+                d["changed"] = now
+            else:
+                # Only call it "changed" when mtime is clearly later than creation,
+                # not the few seconds of difference every freshly written file has.
+                grew = d["mtime"] - d["created"] > 60
+                d["changed"] = d["modified"] if grew else d["first_seen"]
+
+        if d["first_seen"].timestamp() >= fresh_after:
+            d["fresh"] = "new"
+        elif d["changed"].timestamp() >= fresh_after:
+            d["fresh"] = "updated"
+        else:
+            d["fresh"] = None
         docs.append(d)
-    docs.sort(key=lambda d: d["when"], reverse=True)
+
+    key = {"created": "first_seen", "modified": "modified", "updated": "changed"}[sort]
+    docs.sort(key=lambda d: d[key], reverse=True)
     return docs
 
 
@@ -387,8 +469,8 @@ def copy_assets():
     return True
 
 
-def build(sort):
-    docs = collect_docs(sort)
+def build(sort, fresh_days=FRESH_DAYS):
+    docs = collect_docs(sort, fresh_days)
     if not docs:
         print("No .md or .html files found.")
         return False
@@ -412,11 +494,16 @@ def build(sort):
     write("index.html", render_index(docs, sort))
     write("search.json", json.dumps(search, ensure_ascii=False))
     local_assets = copy_assets()
+    save_history(docs)
 
+    fresh = [d for d in docs if d["fresh"]]
     size = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(OUT) for f in fs)
     print("Built %d documents into %s (%.1f MB, assets %s)." % (
         len(docs), os.path.relpath(OUT, ROOT), size / 1e6,
         "self-hosted" if local_assets else "from CDN"))
+    if fresh:
+        print("Badged as new/updated (last %d days): %s" % (
+            fresh_days, ", ".join("%s (%s)" % (d["out"], d["fresh"]) for d in fresh)))
     return True
 
 
@@ -475,14 +562,17 @@ def deploy(target, prune):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sort", choices=["modified", "created"], default="created",
-                    help="which date orders the library page (default: created, like serve.py)")
+    ap.add_argument("--sort", choices=["created", "updated", "modified"], default="created",
+                    help="which date orders the library page: created (default, like serve.py), "
+                         "updated (last content change, from the build history) or modified (file mtime)")
+    ap.add_argument("--fresh-days", type=int, default=FRESH_DAYS, metavar="N",
+                    help="badge documents first seen or changed within the last N days (default: %d)" % FRESH_DAYS)
     ap.add_argument("--deploy", metavar="S3_URI", help="e.g. s3://my-docs-bucket or s3://bucket/prefix")
     ap.add_argument("--prune", action="store_true",
                     help="with --deploy: delete objects in the bucket that are no longer in _site")
     args = ap.parse_args()
 
-    if not build(args.sort):
+    if not build(args.sort, args.fresh_days):
         return 1
     if args.deploy and not deploy(args.deploy, args.prune):
         return 1

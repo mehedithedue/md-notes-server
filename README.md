@@ -21,7 +21,7 @@ and stay on your machine.
 | `serve.py` | The main tool. Serves the folder on port `8000`, renders every `.md` on request, builds the library index page with full-text search, and reloads open pages when a file is saved. Prints the LAN URL plus a QR code. Also holds the shared renderer and page chrome used by the other scripts. |
 | `generate_all_html.py` | Converts `.md` files to standalone `.html` pages for reading straight off disk. Skips files whose page is newer than the source. |
 | `generate_index.py` | Writes a static `index.html` listing every `.html` page. Only needed when browsing off disk; `serve.py` builds its own richer index. |
-| `build_site.py` | Builds the whole library into `_site/` (pages, index, `search.json`, assets) and can upload it to an S3 bucket. |
+| `build_site.py` | Builds the whole library into `_site/` (pages, index, `search.json`, assets), badges new and updated documents, and can upload it to an S3 bucket. |
 
 ## Requirements
 
@@ -88,10 +88,19 @@ python3 generate_index.py               # rebuild index.html only
 
 ```bash
 python3 build_site.py                            # build into ./_site
-python3 build_site.py --sort modified            # order cards by modified date (default: created)
+python3 build_site.py --sort updated             # last content change first (default: created)
+python3 build_site.py --fresh-days 14            # badge anything new/changed in 2 weeks (default: 7)
 python3 build_site.py --deploy s3://my-bucket    # build, then upload
 python3 build_site.py --deploy s3://my-bucket --prune   # also delete removed docs
 ```
+
+Each build stores a content hash of every source in `.build_history.json`
+(gitignored, next to the scripts). On the next build a card shows a **new**
+badge if the document first appeared recently, or an **updated** badge with
+its change date if the text changed recently. This tracks real content
+changes, not file timestamps, so regenerating pages or checking out a branch
+does not mark everything as updated. Delete the file to reset; the next build
+reseeds from file dates.
 
 Deploying needs the AWS CLI installed and signed in (`brew install awscli`,
 then `aws configure`) and a bucket with a public-read policy or CloudFront in

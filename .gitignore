@@ -10,6 +10,9 @@
 # Every Markdown note except the project README.
 *.md
 !README.md
+# Agent / assistant instructions for the repo.
+!AGENTS.md
+!CLAUDE.md
 # Every rendered / hand-written HTML page (index.html, sample.html included).
 *.html
 
@@ -20,6 +23,8 @@ _site/
 assets/
 # Any other generated search index / export dropped at the root.
 search.json
+# build_site.py content-hash history, used for the "new" / "updated" badges.
+.build_history.json
 
 # --- Python ----------------------------------------------------------------
 __pycache__/
