@@ -1,0 +1,3 @@
+markdown>=3.4
+# Optional: shows a QR code in the terminal when the server starts
+qrcode>=7.4
