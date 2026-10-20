@@ -1,30 +1,35 @@
 # MD Notes Server
 
 A small set of Python scripts that turn a folder of Markdown notes into
-styled HTML pages, build a clickable index, and serve everything on your
-local network so you can read your notes from a phone or tablet.
+styled HTML pages, serve them on your local network (with live reload), and
+optionally build a static copy for S3 or any plain file host.
 
 ```
-notes.md ──► generate_all_html.py ──► notes.html
-                                          │
-             generate_index.py ───────► index.html (links to every .html)
-                                          │
-             serve_md.py ─────────────► http://<your-ip>:8080  (+ QR code)
+notes.md ──► serve.py ──────────► http://<your-ip>:8000   (live render, LAN, QR code)
+         ──► generate_all_html.py ──► notes.html           (static page on disk)
+         ──► build_site.py ─────────► _site/               (static site, deployable to S3)
 ```
+
+Only the tooling is versioned. Your notes (`.md`), the rendered pages
+(`.html`), the `_site/` build and the downloaded `assets/` are ignored by git
+and stay on your machine.
 
 ## Scripts
 
 | Script | What it does |
 | --- | --- |
-| `generate_all_html.py` | Converts every `.md` file in the current folder to a dark-themed `.html` page. Skips any file that already has an `.html` version. |
-| `generate_index.py` | Scans the folder (and subfolders) for `.html` files and writes an `index.html` with a link to each one. |
-| `serve_md.py` | Starts a web server on port `8080`, detects your local network IP, and prints the URL plus a QR code you can scan from another device. |
+| `serve.py` | The main tool. Serves the folder on port `8000`, renders every `.md` on request, builds the library index page with full-text search, and reloads open pages when a file is saved. Prints the LAN URL plus a QR code. Also holds the shared renderer and page chrome used by the other scripts. |
+| `generate_all_html.py` | Converts `.md` files to standalone `.html` pages for reading straight off disk. Skips files whose page is newer than the source. |
+| `generate_index.py` | Writes a static `index.html` listing every `.html` page. Only needed when browsing off disk; `serve.py` builds its own richer index. |
+| `build_site.py` | Builds the whole library into `_site/` (pages, index, `search.json`, assets) and can upload it to an S3 bucket. |
 
 ## Requirements
 
 - Python 3.8+
-- [`markdown`](https://pypi.org/project/Markdown/) — needed by `generate_all_html.py`
-- [`qrcode`](https://pypi.org/project/qrcode/) — optional, for the terminal QR code
+- `markdown`, `pymdown-extensions`, `pyyaml` for rendering
+- `qrcode` (optional) for the terminal QR code
+
+All of them are in `requirements.txt`.
 
 ## Setup
 
@@ -40,22 +45,70 @@ pip install -r requirements.txt
 
 ## Usage
 
-Put your `.md` files in the project folder, then run the three steps in order:
+### Read notes on the LAN (most common)
+
+Put your `.md` files in the project folder, then:
 
 ```bash
-python3 generate_all_html.py   # 1. Markdown → HTML
-python3 generate_index.py      # 2. Build index.html
-python3 serve_md.py            # 3. Serve on the local network
+python3 serve.py                 # http://<your-lan-ip>:8000
+python3 serve.py --port 9000
+python3 serve.py --no-qr         # skip the QR code
+python3 serve.py --no-reload     # drop the live-reload watcher
+python3 serve.py --host 127.0.0.1   # local machine only
 ```
 
-Open the printed URL (for example `http://192.168.1.20:8080`) or scan the QR
-code from a device on the same Wi-Fi. Press `Ctrl+C` to stop the server.
+Open the printed URL or scan the QR code from a device on the same Wi-Fi.
+Editing a `.md` and saving it reloads the page on the other device. New files
+show up on the next refresh. Press `Ctrl+C` to stop.
 
-### Updating notes
+### Work offline
 
-- **New note:** run steps 1 and 2 again, then refresh the browser.
-- **Edited note:** delete its old `.html` file first — `generate_all_html.py`
-  never overwrites an existing page.
+By default pages load fonts, Mermaid and highlight.js from CDNs. To self-host
+them so the LAN server works without internet:
+
+```bash
+python3 serve.py --fetch-assets
+```
+
+This fills `assets/` (fonts, `mermaid.min.js`, `highlight.min.js`). Kroki
+diagrams and MathJax still need internet.
+
+### Static pages on disk
+
+```bash
+python3 generate_all_html.py            # every .md in the folder
+python3 generate_all_html.py notes.md   # just these files
+python3 generate_all_html.py -r         # include subfolders
+python3 generate_all_html.py -f         # force rebuild, ignore timestamps
+python3 generate_all_html.py --index    # also rebuild index.html afterwards
+python3 generate_index.py               # rebuild index.html only
+```
+
+### Static site for S3
+
+```bash
+python3 build_site.py                            # build into ./_site
+python3 build_site.py --sort modified            # order cards by modified date (default: created)
+python3 build_site.py --deploy s3://my-bucket    # build, then upload
+python3 build_site.py --deploy s3://my-bucket --prune   # also delete removed docs
+```
+
+Deploying needs the AWS CLI installed and signed in (`brew install awscli`,
+then `aws configure`) and a bucket with a public-read policy or CloudFront in
+front of it. Open the site at `.../index.html`; the plain bucket endpoint does
+not serve an index document for `/`.
+
+## Rendering
+
+GitHub-flavoured Markdown (tables, task lists, strikethrough, autolinks,
+emoji, footnotes, definition lists), YAML front matter shown as a table,
+`> [!NOTE]`-style alerts, highlight.js code colouring with a language label
+and copy button, Mermaid, PlantUML / D2 / Graphviz / Vega-Lite / WaveDrom
+fences via kroki.io, and LaTeX math via MathJax. Dark theme by default with a
+light toggle and a width toggle on every page.
+
+All three outputs (LAN server, pages on disk, `_site/`) share the same
+renderer in `serve.py`, so they look identical.
 
 ## Configuration
 
@@ -63,16 +116,17 @@ Settings are constants at the top of each script:
 
 | Setting | File | Default |
 | --- | --- | --- |
-| `PORT` | `serve_md.py` | `8080` |
-| `TITLE` | `generate_index.py` | `"My Notes"` |
-| `CSS` | `generate_index.py` | Light theme for the index page |
-| `TEMPLATE` | `generate_all_html.py` | Dark theme (Inter font) for note pages |
+| `--port` flag | `serve.py` | `8000` |
+| `HIDDEN` | `serve.py`, `generate_index.py` | `index.html`, `sample.html` are left out of the index |
+| `IGNORE_DIRS` | `serve.py`, `generate_index.py` | `.venv`, `venv`, `.git`, `.claude`, `_site`, … |
+| `TITLE` | `build_site.py`, `generate_index.py` | `"Docs Library"` |
+| `OUT` | `build_site.py` | `./_site` |
 
 ## Notes and limitations
 
 - The server shares **everything** in the folder with anyone on your network.
-  Only run it on networks you trust.
-- `index.html` lists itself after the first run, since it is also an `.html` file.
+  Only run it on networks you trust, or bind with `--host 127.0.0.1`.
+- `build_site.py` wipes `_site/` before each build. It checks for its own
+  marker file first, so it will refuse to delete a folder it did not create.
 - If you restart the server right away you may see `Address already in use`;
-  wait a few seconds or change `PORT`.
-- Markdown extensions enabled: `extra`, `tables`, `fenced_code`, `toc`.
+  wait a few seconds or pick another `--port`.
